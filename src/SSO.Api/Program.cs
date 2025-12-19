@@ -1,15 +1,21 @@
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using sso.api.Configuration;
 using sso.api.Services;
+using SSO.Infrastructure.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Configure Settings
 builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("JwtSettings"));
 builder.Services.Configure<RedisSettings>(builder.Configuration.GetSection("RedisSettings"));
+
+// Configure DbContext
+builder.Services.AddDbContext<SsoDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 
 var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
 var redisSettings = builder.Configuration.GetSection("RedisSettings").Get<RedisSettings>()!;

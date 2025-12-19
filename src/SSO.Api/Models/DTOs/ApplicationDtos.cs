@@ -11,7 +11,7 @@ public class RegisterApplicationRequest
 
     public string[]? RedirectUris { get; set; }
 }
-
+    
 public class ApplicationResponse
 {
     public bool Success { get; set; }
