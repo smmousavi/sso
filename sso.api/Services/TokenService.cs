@@ -6,19 +6,21 @@ using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using sso.api.Configuration;
 using sso.api.Models;
-
+ 
 namespace sso.api.Services;
 
 public class TokenService : ITokenService
 {
     private readonly JwtSettings _jwtSettings;
+    private const string SessionIdClaimType = "session_id";
+    private const string ClientIdClaimType = "client_id";
 
     public TokenService(IOptions<JwtSettings> jwtSettings)
     {
         _jwtSettings = jwtSettings.Value;
     }
 
-    public string GenerateAccessToken(User user)
+    public string GenerateAccessToken(User user, string? clientId = null, string? sessionId = null)
     {
         var securityKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtSettings.SecretKey));
         var credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
@@ -31,6 +33,16 @@ public class TokenService : ITokenService
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
             new(JwtRegisteredClaimNames.Iat, DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(), ClaimValueTypes.Integer64)
         };
+
+        if (!string.IsNullOrEmpty(sessionId))
+        {
+            claims.Add(new Claim(SessionIdClaimType, sessionId));
+        }
+
+        if (!string.IsNullOrEmpty(clientId))
+        {
+            claims.Add(new Claim(ClientIdClaimType, clientId));
+        }
 
         foreach (var role in user.Roles)
         {
@@ -87,5 +99,62 @@ public class TokenService : ITokenService
         {
             return null;
         }
+    }
+
+    public ClaimsPrincipal? ValidateToken(string token)
+    {
+        var tokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateAudience = true,
+            ValidateIssuer = true,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtSettings.SecretKey)),
+            ValidateLifetime = true,
+            ValidIssuer = _jwtSettings.Issuer,
+            ValidAudience = _jwtSettings.Audience,
+            ClockSkew = TimeSpan.Zero
+        };
+
+        var tokenHandler = new JwtSecurityTokenHandler();
+
+        try
+        {
+            var principal = tokenHandler.ValidateToken(token, tokenValidationParameters, out var securityToken);
+
+            if (securityToken is not JwtSecurityToken jwtSecurityToken ||
+                !jwtSecurityToken.Header.Alg.Equals(SecurityAlgorithms.HmacSha256, StringComparison.InvariantCultureIgnoreCase))
+            {
+                return null;
+            }
+
+            return principal;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public string? GetSessionIdFromToken(string token)
+    {
+        var principal = GetPrincipalFromExpiredToken(token);
+        return principal?.FindFirst(SessionIdClaimType)?.Value;
+    }
+
+    public string? GetClientIdFromToken(string token)
+    {
+        var principal = GetPrincipalFromExpiredToken(token);
+        return principal?.FindFirst(ClientIdClaimType)?.Value;
+    }
+
+    public Guid? GetUserIdFromToken(string token)
+    {
+        var principal = GetPrincipalFromExpiredToken(token);
+        var userIdClaim = principal?.FindFirst(JwtRegisteredClaimNames.Sub)?.Value;
+        
+        if (string.IsNullOrEmpty(userIdClaim) || !Guid.TryParse(userIdClaim, out var userId))
+            return null;
+
+        return userId;
     }
 }

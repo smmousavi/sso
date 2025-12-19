@@ -7,9 +7,19 @@ using sso.api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Configure JWT Settings
+// Configure Settings
 builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("JwtSettings"));
+builder.Services.Configure<RedisSettings>(builder.Configuration.GetSection("RedisSettings"));
+
 var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
+var redisSettings = builder.Configuration.GetSection("RedisSettings").Get<RedisSettings>()!;
+
+// Add Redis distributed cache
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = redisSettings.ConnectionString;
+    options.InstanceName = redisSettings.InstanceName;
+});
 
 // Add Authentication
 builder.Services.AddAuthentication(options =>
@@ -30,6 +40,22 @@ builder.Services.AddAuthentication(options =>
         IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSettings.SecretKey)),
         ClockSkew = TimeSpan.Zero
     };
+
+    // Add token validation event to check revocation
+    options.Events = new JwtBearerEvents
+    {
+        OnTokenValidated = async context =>
+        {
+            var sessionService = context.HttpContext.RequestServices.GetRequiredService<ISessionService>();
+            var token = context.Request.Headers.Authorization.ToString().Replace("Bearer ", "");
+
+            var isRevoked = await sessionService.IsTokenRevokedAsync(token);
+            if (isRevoked)
+            {
+                context.Fail("Token has been revoked");
+            }
+        }
+    };
 });
 
 builder.Services.AddAuthorization();
@@ -37,6 +63,8 @@ builder.Services.AddAuthorization();
 // Register Services
 builder.Services.AddSingleton<IUserService, UserService>();
 builder.Services.AddSingleton<ITokenService, TokenService>();
+builder.Services.AddSingleton<IApplicationService, ApplicationService>();
+builder.Services.AddSingleton<ISessionService, RedisSessionService>();
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
@@ -46,7 +74,7 @@ builder.Services.AddSwaggerGen(c =>
     {
         Title = "SSO API",
         Version = "v1",
-        Description = "Single Sign-On API with JWT Authentication"
+        Description = "Single Sign-On API with JWT Authentication and Multi-Application Support"
     });
 
     c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
