@@ -5,7 +5,9 @@ using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using sso.api.Configuration;
 using sso.api.Services;
+using SSO.Application.Interfaces;
 using SSO.Infrastructure.Persistence;
+using SSO.Infrastructure.Persistence.Repositories;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -52,13 +54,22 @@ builder.Services.AddAuthentication(options =>
     {
         OnTokenValidated = async context =>
         {
-            var sessionService = context.HttpContext.RequestServices.GetRequiredService<ISessionService>();
-            var token = context.Request.Headers.Authorization.ToString().Replace("Bearer ", "");
-
-            var isRevoked = await sessionService.IsTokenRevokedAsync(token);
-            if (isRevoked)
+            try
             {
-                context.Fail("Token has been revoked");
+                var sessionService = context.HttpContext.RequestServices.GetRequiredService<ISessionService>();
+                var token = context.Request.Headers.Authorization.ToString().Replace("Bearer ", "");
+
+                var isRevoked = await sessionService.IsTokenRevokedAsync(token);
+                if (isRevoked)
+                {
+                    context.Fail("Token has been revoked");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log the error but don't fail authentication if Redis is unavailable
+                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
+                logger.LogWarning(ex, "Failed to check token revocation status. Allowing authentication to proceed.");
             }
         }
     };
@@ -66,10 +77,16 @@ builder.Services.AddAuthentication(options =>
 
 builder.Services.AddAuthorization();
 
+// Register Repositories and UnitOfWork
+builder.Services.AddScoped<IUserRepository, UserRepository>();
+builder.Services.AddScoped<IClientApplicationRepository, ClientApplicationRepository>();
+builder.Services.AddScoped<ISessionRepository, SessionRepository>();
+builder.Services.AddScoped<IUnitOfWork, UnitOfWork>();
+
 // Register Services
-builder.Services.AddSingleton<IUserService, UserService>();
-builder.Services.AddSingleton<ITokenService, TokenService>();
-builder.Services.AddSingleton<IApplicationService, ApplicationService>();
+builder.Services.AddScoped<IUserService, UserService>();
+builder.Services.AddSingleton<sso.api.Services.ITokenService, TokenService>();
+builder.Services.AddScoped<IApplicationService, ApplicationService>();
 builder.Services.AddSingleton<ISessionService, RedisSessionService>();
 
 builder.Services.AddControllers();

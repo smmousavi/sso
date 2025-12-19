@@ -1,105 +1,79 @@
 using System.Security.Cryptography;
-using System.Text.Json;
-using Microsoft.Extensions.Caching.Distributed;
 using sso.api.Models;
+using SSO.Application.Interfaces;
 
 namespace sso.api.Services;
 
 public class UserService : IUserService
 {
-    private readonly IDistributedCache _cache;
-    private const string UserPrefix = "user:";
-    private const string UsernameIndexPrefix = "user_username:";
-    private const string EmailIndexPrefix = "user_email:";
-    private const string AllUsersKey = "users:all";
+    private readonly IUnitOfWork _unitOfWork;
 
-    public UserService(IDistributedCache cache)
+    public UserService(IUnitOfWork unitOfWork)
     {
-        _cache = cache;
+        _unitOfWork = unitOfWork;
     }
 
     public async Task<User?> GetByIdAsync(Guid id)
     {
-        var userJson = await _cache.GetStringAsync($"{UserPrefix}{id}");
-        if (string.IsNullOrEmpty(userJson))
+        var user = await _unitOfWork.Users.GetByIdAsync(id);
+        if (user == null || !user.IsActive)
             return null;
 
-        return JsonSerializer.Deserialize<User>(userJson);
+        return MapToApiModel(user);
     }
 
     public async Task<User?> GetByUsernameAsync(string username)
     {
-        var userId = await _cache.GetStringAsync($"{UsernameIndexPrefix}{username.ToLowerInvariant()}");
-        if (string.IsNullOrEmpty(userId))
+        var user = await _unitOfWork.Users.GetByUsernameAsync(username);
+        if (user == null || !user.IsActive)
             return null;
 
-        return await GetByIdAsync(Guid.Parse(userId));
+        return MapToApiModel(user);
     }
 
     public async Task<User?> GetByEmailAsync(string email)
     {
-        var userId = await _cache.GetStringAsync($"{EmailIndexPrefix}{email.ToLowerInvariant()}");
-        if (string.IsNullOrEmpty(userId))
+        var user = await _unitOfWork.Users.GetByEmailAsync(email);
+        if (user == null || !user.IsActive)
             return null;
 
-        return await GetByIdAsync(Guid.Parse(userId));
+        return MapToApiModel(user);
     }
 
     public async Task<User?> GetByRefreshTokenAsync(string refreshToken)
     {
-        var users = await GetAllAsync();
-        return users.FirstOrDefault(u =>
+        var users = await _unitOfWork.Users.GetAllAsync();
+        var user = users.FirstOrDefault(u =>
             u.RefreshToken == refreshToken &&
-            u.RefreshTokenExpiryTime > DateTime.UtcNow);
+            u.RefreshTokenExpiryTime > DateTime.UtcNow &&
+            u.IsActive);
+
+        return user != null ? MapToApiModel(user) : null;
     }
 
     public async Task<IEnumerable<User>> GetAllAsync()
     {
-        var userIdsJson = await _cache.GetStringAsync(AllUsersKey);
-        if (string.IsNullOrEmpty(userIdsJson))
-            return [];
-
-        var userIds = JsonSerializer.Deserialize<List<Guid>>(userIdsJson) ?? [];
-        var users = new List<User>();
-
-        foreach (var id in userIds)
-        {
-            var user = await GetByIdAsync(id);
-            if (user != null)
-                users.Add(user);
-        }
-
-        return users;
+        var users = await _unitOfWork.Users.GetAllAsync();
+        return users.Select(MapToApiModel);
     }
 
     public async Task<User> CreateAsync(string username, string email, string password)
     {
-        var user = new User
+        var user = new SSO.Domain.Entities.User
         {
             Id = Guid.NewGuid(),
             Username = username,
             Email = email,
             PasswordHash = HashPassword(password),
             Roles = ["User"],
-            CreatedAt = DateTime.UtcNow
+            CreatedAt = DateTime.UtcNow,
+            IsActive = true
         };
 
-        await SaveUserAsync(user);
+        await _unitOfWork.Users.AddAsync(user);
+        await _unitOfWork.SaveChangesAsync();
 
-        // Create username index
-        await _cache.SetStringAsync(
-            $"{UsernameIndexPrefix}{username.ToLowerInvariant()}",
-            user.Id.ToString());
-
-        // Create email index
-        await _cache.SetStringAsync(
-            $"{EmailIndexPrefix}{email.ToLowerInvariant()}",
-            user.Id.ToString());
-
-        // Add to all users list
-        await AddToUserListAsync(user.Id);
-
-        return user;
+        return MapToApiModel(user);
     }
 
     public Task<bool> ValidatePasswordAsync(User user, string password)
@@ -110,80 +84,75 @@ public class UserService : IUserService
 
     public async Task UpdateRefreshTokenAsync(User user, string refreshToken, DateTime expiryTime)
     {
-        user.RefreshToken = refreshToken;
-        user.RefreshTokenExpiryTime = expiryTime;
-        await SaveUserAsync(user);
+        var domainUser = await _unitOfWork.Users.GetByIdAsync(user.Id);
+        if (domainUser != null)
+        {
+            domainUser.RefreshToken = refreshToken;
+            domainUser.RefreshTokenExpiryTime = expiryTime;
+            await _unitOfWork.Users.UpdateAsync(domainUser);
+            await _unitOfWork.SaveChangesAsync();
+        }
     }
 
     public async Task RevokeRefreshTokenAsync(User user)
     {
-        user.RefreshToken = null;
-        user.RefreshTokenExpiryTime = null;
-        await SaveUserAsync(user);
+        var domainUser = await _unitOfWork.Users.GetByIdAsync(user.Id);
+        if (domainUser != null)
+        {
+            domainUser.RefreshToken = null;
+            domainUser.RefreshTokenExpiryTime = null;
+            await _unitOfWork.Users.UpdateAsync(domainUser);
+            await _unitOfWork.SaveChangesAsync();
+        }
     }
 
     public async Task UpdateLastLoginAsync(User user)
     {
-        user.LastLoginAt = DateTime.UtcNow;
-        await SaveUserAsync(user);
+        var domainUser = await _unitOfWork.Users.GetByIdAsync(user.Id);
+        if (domainUser != null)
+        {
+            domainUser.LastLoginAt = DateTime.UtcNow;
+            await _unitOfWork.Users.UpdateAsync(domainUser);
+            await _unitOfWork.SaveChangesAsync();
+        }
     }
 
     public async Task UpdateRolesAsync(User user, string[] roles)
     {
-        user.Roles = roles;
-        await SaveUserAsync(user);
+        var domainUser = await _unitOfWork.Users.GetByIdAsync(user.Id);
+        if (domainUser != null)
+        {
+            domainUser.Roles = roles;
+            await _unitOfWork.Users.UpdateAsync(domainUser);
+            await _unitOfWork.SaveChangesAsync();
+        }
     }
 
     public async Task<bool> DeleteAsync(Guid id)
     {
-        var user = await GetByIdAsync(id);
+        var user = await _unitOfWork.Users.GetByIdAsync(id);
         if (user == null)
             return false;
 
-        // Remove user
-        await _cache.RemoveAsync($"{UserPrefix}{id}");
-
-        // Remove username index
-        await _cache.RemoveAsync($"{UsernameIndexPrefix}{user.Username.ToLowerInvariant()}");
-
-        // Remove email index
-        await _cache.RemoveAsync($"{EmailIndexPrefix}{user.Email.ToLowerInvariant()}");
-
-        // Remove from all users list
-        await RemoveFromUserListAsync(id);
-
+        await _unitOfWork.Users.DeleteAsync(id);
+        await _unitOfWork.SaveChangesAsync();
         return true;
     }
 
-    private async Task SaveUserAsync(User user)
+    private static User MapToApiModel(SSO.Domain.Entities.User domainUser)
     {
-        var userJson = JsonSerializer.Serialize(user);
-        await _cache.SetStringAsync($"{UserPrefix}{user.Id}", userJson);
-    }
-
-    private async Task AddToUserListAsync(Guid userId)
-    {
-        var userIdsJson = await _cache.GetStringAsync(AllUsersKey);
-        var userIds = string.IsNullOrEmpty(userIdsJson)
-            ? new List<Guid>()
-            : JsonSerializer.Deserialize<List<Guid>>(userIdsJson) ?? [];
-
-        if (!userIds.Contains(userId))
+        return new User
         {
-            userIds.Add(userId);
-            await _cache.SetStringAsync(AllUsersKey, JsonSerializer.Serialize(userIds));
-        }
-    }
-
-    private async Task RemoveFromUserListAsync(Guid userId)
-    {
-        var userIdsJson = await _cache.GetStringAsync(AllUsersKey);
-        if (string.IsNullOrEmpty(userIdsJson))
-            return;
-
-        var userIds = JsonSerializer.Deserialize<List<Guid>>(userIdsJson) ?? [];
-        userIds.Remove(userId);
-        await _cache.SetStringAsync(AllUsersKey, JsonSerializer.Serialize(userIds));
+            Id = domainUser.Id,
+            Username = domainUser.Username,
+            Email = domainUser.Email,
+            PasswordHash = domainUser.PasswordHash,
+            Roles = domainUser.Roles,
+            RefreshToken = domainUser.RefreshToken,
+            RefreshTokenExpiryTime = domainUser.RefreshTokenExpiryTime,
+            CreatedAt = domainUser.CreatedAt,
+            LastLoginAt = domainUser.LastLoginAt
+        };
     }
 
     private static string HashPassword(string password)
@@ -223,3 +192,4 @@ public class UserService : IUserService
         return true;
     }
 }
+

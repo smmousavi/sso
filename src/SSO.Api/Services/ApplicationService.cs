@@ -1,22 +1,28 @@
-using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using sso.api.Models;
+using SSO.Application.Interfaces;
 
 namespace sso.api.Services;
 
 public class ApplicationService : IApplicationService
 {
-    private static readonly ConcurrentDictionary<string, ClientApplication> _applications = new();
+    private readonly IUnitOfWork _unitOfWork;
 
-    public Task<ClientApplication> RegisterAsync(string name, string[]? scopes, string[]? redirectUris)
+    public ApplicationService(IUnitOfWork unitOfWork)
+    {
+        _unitOfWork = unitOfWork;
+    }
+
+    public async Task<ClientApplication> RegisterAsync(string name, string[]? scopes, string[]? redirectUris)
     {
         var clientId = GenerateClientId();
         var clientSecret = GenerateClientSecret();
 
-        var app = new ClientApplication
+        var app = new SSO.Domain.Entities.ClientApplication
         {
+            Id = Guid.NewGuid(),
             ClientId = clientId,
-            ClientSecret = HashSecret(clientSecret),
+            ClientSecretHash = HashSecret(clientSecret),
             Name = name,
             AllowedScopes = scopes ?? ["openid", "profile", "email"],
             RedirectUris = redirectUris ?? [],
@@ -24,10 +30,11 @@ public class ApplicationService : IApplicationService
             CreatedAt = DateTime.UtcNow
         };
 
-        _applications.TryAdd(clientId, app);
+        await _unitOfWork.ClientApplications.AddAsync(app);
+        await _unitOfWork.SaveChangesAsync();
 
         // Return with unhashed secret for initial display only
-        return Task.FromResult(new ClientApplication
+        return new ClientApplication
         {
             ClientId = clientId,
             ClientSecret = clientSecret, // Return plain secret only once
@@ -36,54 +43,62 @@ public class ApplicationService : IApplicationService
             RedirectUris = app.RedirectUris,
             IsActive = app.IsActive,
             CreatedAt = app.CreatedAt
+        };
+    }
+
+    public async Task<ClientApplication?> GetByClientIdAsync(string clientId)
+    {
+        var app = await _unitOfWork.ClientApplications.GetByClientIdAsync(clientId);
+        if (app == null || !app.IsActive)
+            return null;
+
+        return new ClientApplication
+        {
+            ClientId = app.ClientId,
+            ClientSecret = "***", // Never expose secret
+            Name = app.Name,
+            AllowedScopes = app.AllowedScopes,
+            RedirectUris = app.RedirectUris,
+            IsActive = app.IsActive,
+            CreatedAt = app.CreatedAt
+        };
+    }
+
+    public async Task<bool> ValidateClientAsync(string clientId, string clientSecret)
+    {
+        var app = await _unitOfWork.ClientApplications.GetByClientIdAsync(clientId);
+        if (app == null || !app.IsActive)
+            return false;
+
+        return VerifySecret(clientSecret, app.ClientSecretHash);
+    }
+
+    public async Task<IEnumerable<ClientApplication>> GetAllAsync()
+    {
+        var apps = await _unitOfWork.ClientApplications.GetAllAsync();
+        
+        return apps.Select(a => new ClientApplication
+        {
+            ClientId = a.ClientId,
+            ClientSecret = "***", // Never expose secret
+            Name = a.Name,
+            AllowedScopes = a.AllowedScopes,
+            RedirectUris = a.RedirectUris,
+            IsActive = a.IsActive,
+            CreatedAt = a.CreatedAt
         });
     }
 
-    public Task<ClientApplication?> GetByClientIdAsync(string clientId)
+    public async Task<bool> DeactivateAsync(string clientId)
     {
-        _applications.TryGetValue(clientId, out var app);
-        if (app == null || !app.IsActive)
-            return Task.FromResult<ClientApplication?>(null);
-
-        return Task.FromResult<ClientApplication?>(app);
-    }
-
-    public Task<bool> ValidateClientAsync(string clientId, string clientSecret)
-    {
-        if (!_applications.TryGetValue(clientId, out var app))
-            return Task.FromResult(false);
-
-        if (!app.IsActive)
-            return Task.FromResult(false);
-
-        return Task.FromResult(VerifySecret(clientSecret, app.ClientSecret));
-    }
-
-    public Task<IEnumerable<ClientApplication>> GetAllAsync()
-    {
-        var apps = _applications.Values
-            .Where(a => a.IsActive)
-            .Select(a => new ClientApplication
-            {
-                ClientId = a.ClientId,
-                ClientSecret = "***", // Never expose secret
-                Name = a.Name,
-                AllowedScopes = a.AllowedScopes,
-                RedirectUris = a.RedirectUris,
-                IsActive = a.IsActive,
-                CreatedAt = a.CreatedAt
-            });
-
-        return Task.FromResult(apps);
-    }
-
-    public Task<bool> DeactivateAsync(string clientId)
-    {
-        if (!_applications.TryGetValue(clientId, out var app))
-            return Task.FromResult(false);
+        var app = await _unitOfWork.ClientApplications.GetByClientIdAsync(clientId);
+        if (app == null)
+            return false;
 
         app.IsActive = false;
-        return Task.FromResult(true);
+        await _unitOfWork.ClientApplications.UpdateAsync(app);
+        await _unitOfWork.SaveChangesAsync();
+        return true;
     }
 
     private static string GenerateClientId()
