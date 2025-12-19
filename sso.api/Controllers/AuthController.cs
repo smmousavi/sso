@@ -33,52 +33,6 @@ public class AuthController : ControllerBase
         _jwtSettings = jwtSettings.Value;
     }
 
-    [HttpPost("register")]
-    public async Task<ActionResult<AuthResponse>> Register([FromBody] RegisterRequest request)
-    {
-        var existingUser = await _userService.GetByUsernameAsync(request.Username);
-        if (existingUser != null)
-        {
-            return BadRequest(new AuthResponse
-            {
-                Success = false,
-                Message = "Username already exists"
-            });
-        }
-
-        var user = await _userService.CreateAsync(request.Username, request.Email, request.Password);
-
-        // Create SSO session
-        var session = await _sessionService.CreateSessionAsync(user);
-
-        var accessToken = _tokenService.GenerateAccessToken(user, null, session.SessionId);
-        var refreshToken = _tokenService.GenerateRefreshToken();
-
-        await _userService.UpdateRefreshTokenAsync(
-            user,
-            refreshToken,
-            DateTime.UtcNow.AddDays(_jwtSettings.RefreshTokenExpirationDays));
-
-        await _userService.UpdateLastLoginAsync(user);
-
-        return Ok(new AuthResponse
-        {
-            Success = true,
-            Message = "Registration successful",
-            SessionId = session.SessionId,
-            AccessToken = accessToken,
-            RefreshToken = refreshToken,
-            ExpiresAt = DateTime.UtcNow.AddMinutes(_jwtSettings.AccessTokenExpirationMinutes),
-            User = new UserDto
-            {
-                Id = user.Id,
-                Username = user.Username,
-                Email = user.Email,
-                Roles = user.Roles
-            }
-        });
-    }
-
     [HttpPost("login")]
     public async Task<ActionResult<AuthResponse>> Login([FromBody] LoginRequest request)
     {

@@ -1,35 +1,78 @@
-using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Text.Json;
+using Microsoft.Extensions.Caching.Distributed;
 using sso.api.Models;
 
 namespace sso.api.Services;
 
 public class UserService : IUserService
 {
-    private static readonly ConcurrentDictionary<Guid, User> _users = new();
+    private readonly IDistributedCache _cache;
+    private const string UserPrefix = "user:";
+    private const string UsernameIndexPrefix = "user_username:";
+    private const string EmailIndexPrefix = "user_email:";
+    private const string AllUsersKey = "users:all";
 
-    public Task<User?> GetByIdAsync(Guid id)
+    public UserService(IDistributedCache cache)
     {
-        _users.TryGetValue(id, out var user);
-        return Task.FromResult(user);
+        _cache = cache;
     }
 
-    public Task<User?> GetByUsernameAsync(string username)
+    public async Task<User?> GetByIdAsync(Guid id)
     {
-        var user = _users.Values.FirstOrDefault(u =>
-            u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
-        return Task.FromResult(user);
+        var userJson = await _cache.GetStringAsync($"{UserPrefix}{id}");
+        if (string.IsNullOrEmpty(userJson))
+            return null;
+
+        return JsonSerializer.Deserialize<User>(userJson);
     }
 
-    public Task<User?> GetByRefreshTokenAsync(string refreshToken)
+    public async Task<User?> GetByUsernameAsync(string username)
     {
-        var user = _users.Values.FirstOrDefault(u =>
+        var userId = await _cache.GetStringAsync($"{UsernameIndexPrefix}{username.ToLowerInvariant()}");
+        if (string.IsNullOrEmpty(userId))
+            return null;
+
+        return await GetByIdAsync(Guid.Parse(userId));
+    }
+
+    public async Task<User?> GetByEmailAsync(string email)
+    {
+        var userId = await _cache.GetStringAsync($"{EmailIndexPrefix}{email.ToLowerInvariant()}");
+        if (string.IsNullOrEmpty(userId))
+            return null;
+
+        return await GetByIdAsync(Guid.Parse(userId));
+    }
+
+    public async Task<User?> GetByRefreshTokenAsync(string refreshToken)
+    {
+        var users = await GetAllAsync();
+        return users.FirstOrDefault(u =>
             u.RefreshToken == refreshToken &&
             u.RefreshTokenExpiryTime > DateTime.UtcNow);
-        return Task.FromResult(user);
     }
 
-    public Task<User> CreateAsync(string username, string email, string password)
+    public async Task<IEnumerable<User>> GetAllAsync()
+    {
+        var userIdsJson = await _cache.GetStringAsync(AllUsersKey);
+        if (string.IsNullOrEmpty(userIdsJson))
+            return [];
+
+        var userIds = JsonSerializer.Deserialize<List<Guid>>(userIdsJson) ?? [];
+        var users = new List<User>();
+
+        foreach (var id in userIds)
+        {
+            var user = await GetByIdAsync(id);
+            if (user != null)
+                users.Add(user);
+        }
+
+        return users;
+    }
+
+    public async Task<User> CreateAsync(string username, string email, string password)
     {
         var user = new User
         {
@@ -41,8 +84,22 @@ public class UserService : IUserService
             CreatedAt = DateTime.UtcNow
         };
 
-        _users.TryAdd(user.Id, user);
-        return Task.FromResult(user);
+        await SaveUserAsync(user);
+
+        // Create username index
+        await _cache.SetStringAsync(
+            $"{UsernameIndexPrefix}{username.ToLowerInvariant()}",
+            user.Id.ToString());
+
+        // Create email index
+        await _cache.SetStringAsync(
+            $"{EmailIndexPrefix}{email.ToLowerInvariant()}",
+            user.Id.ToString());
+
+        // Add to all users list
+        await AddToUserListAsync(user.Id);
+
+        return user;
     }
 
     public Task<bool> ValidatePasswordAsync(User user, string password)
@@ -51,24 +108,82 @@ public class UserService : IUserService
         return Task.FromResult(result);
     }
 
-    public Task UpdateRefreshTokenAsync(User user, string refreshToken, DateTime expiryTime)
+    public async Task UpdateRefreshTokenAsync(User user, string refreshToken, DateTime expiryTime)
     {
         user.RefreshToken = refreshToken;
         user.RefreshTokenExpiryTime = expiryTime;
-        return Task.CompletedTask;
+        await SaveUserAsync(user);
     }
 
-    public Task RevokeRefreshTokenAsync(User user)
+    public async Task RevokeRefreshTokenAsync(User user)
     {
         user.RefreshToken = null;
         user.RefreshTokenExpiryTime = null;
-        return Task.CompletedTask;
+        await SaveUserAsync(user);
     }
 
-    public Task UpdateLastLoginAsync(User user)
+    public async Task UpdateLastLoginAsync(User user)
     {
         user.LastLoginAt = DateTime.UtcNow;
-        return Task.CompletedTask;
+        await SaveUserAsync(user);
+    }
+
+    public async Task UpdateRolesAsync(User user, string[] roles)
+    {
+        user.Roles = roles;
+        await SaveUserAsync(user);
+    }
+
+    public async Task<bool> DeleteAsync(Guid id)
+    {
+        var user = await GetByIdAsync(id);
+        if (user == null)
+            return false;
+
+        // Remove user
+        await _cache.RemoveAsync($"{UserPrefix}{id}");
+
+        // Remove username index
+        await _cache.RemoveAsync($"{UsernameIndexPrefix}{user.Username.ToLowerInvariant()}");
+
+        // Remove email index
+        await _cache.RemoveAsync($"{EmailIndexPrefix}{user.Email.ToLowerInvariant()}");
+
+        // Remove from all users list
+        await RemoveFromUserListAsync(id);
+
+        return true;
+    }
+
+    private async Task SaveUserAsync(User user)
+    {
+        var userJson = JsonSerializer.Serialize(user);
+        await _cache.SetStringAsync($"{UserPrefix}{user.Id}", userJson);
+    }
+
+    private async Task AddToUserListAsync(Guid userId)
+    {
+        var userIdsJson = await _cache.GetStringAsync(AllUsersKey);
+        var userIds = string.IsNullOrEmpty(userIdsJson)
+            ? new List<Guid>()
+            : JsonSerializer.Deserialize<List<Guid>>(userIdsJson) ?? [];
+
+        if (!userIds.Contains(userId))
+        {
+            userIds.Add(userId);
+            await _cache.SetStringAsync(AllUsersKey, JsonSerializer.Serialize(userIds));
+        }
+    }
+
+    private async Task RemoveFromUserListAsync(Guid userId)
+    {
+        var userIdsJson = await _cache.GetStringAsync(AllUsersKey);
+        if (string.IsNullOrEmpty(userIdsJson))
+            return;
+
+        var userIds = JsonSerializer.Deserialize<List<Guid>>(userIdsJson) ?? [];
+        userIds.Remove(userId);
+        await _cache.SetStringAsync(AllUsersKey, JsonSerializer.Serialize(userIds));
     }
 
     private static string HashPassword(string password)
